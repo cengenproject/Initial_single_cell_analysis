@@ -1,0 +1,191 @@
+get.gene.id.m3 <- function(symbol, cds = NULL, fData.df = NULL) {
+    if (is.null(fData.df))
+        fData.df = rowData(cds)
+    gene.id = as.character(fData.df[fData.df$gene_short_name == symbol, "id"])
+    return(gene.id)
+}
+
+
+lots_plot_genes_jitter.m3 <- function (cds, gene, grouping = "State", min_expr = NULL, cell_size = 0.75, 
+          nrow = NULL, ncol = 1, panel_order = NULL, color_by = NULL, 
+          plot_trend = FALSE, label_by_short_name = TRUE, relative_expr = TRUE) 
+  {
+  cds_subset <- cds[get.gene.id.m3(gene, cds),]
+  
+  integer_expression <- TRUE
+  relative_expression <- FALSE
+
+  if (integer_expression) {
+    cds_exprs <- cds_subset@assays$data$counts
+    if (relative_expr) {
+      if (is.null(size_factors(cds_subset))) {
+        stop("Error: to call this function with relative_expr=TRUE, you must call estimateSizeFactors() first")
+      }
+      cds_exprs <- Matrix::t(Matrix::t(cds_exprs)/size_factors(cds_subset))
+    }
+    cds_exprs <- reshape2::melt(round(as.matrix(cds_exprs)))
+  }
+  else {
+    cds_exprs <- cds_subset@assays$data$counts
+    cds_exprs <- reshape2::melt(as.matrix(cds_exprs))
+  }
+  if (is.null(min_expr)) {
+    min_expr <- 0.1
+  }
+  colnames(cds_exprs) <- c("f_id", "Cell", "expression")
+  cds_exprs$expression[cds_exprs$expression < min_expr] <- min_expr
+  cds_pData <- as.data.frame(colData(cds_subset))
+  cds_fData <- as.data.frame(rowData(cds_subset))
+  cds_exprs <- as.data.frame(cds_exprs)
+  cds_exprs <- merge(cds_exprs, cds_fData, by.x = "f_id", by.y = "row.names")
+  cds_exprs <- merge(cds_exprs, cds_pData, by.x = "Cell", by.y = "row.names")
+  cds_exprs$adjusted_expression <- log10(cds_exprs$expression)
+  if (label_by_short_name == TRUE) {
+    if (is.null(cds_exprs$gene_short_name) == FALSE) {
+      cds_exprs$feature_label <- cds_exprs$gene_short_name
+      cds_exprs$feature_label[is.na(cds_exprs$feature_label)] <- cds_exprs$f_id
+    }
+    else {
+      cds_exprs$feature_label <- cds_exprs$f_id
+    }
+  }
+  else {
+    cds_exprs$feature_label <- cds_exprs$f_id
+  }
+  if (is.null(panel_order) == FALSE) {
+    cds_exprs$feature_label <- factor(cds_exprs$feature_label, 
+                                      levels = panel_order)
+  }
+  q <- ggplot(aes_string(x = grouping, y = "expression"), data = cds_exprs)
+  if (is.null(color_by) == FALSE) {
+    q <- q + geom_jitter(aes_string(color = color_by), size = I(cell_size))
+  }
+  else {
+    q <- q + geom_jitter(size = I(cell_size))
+  }
+  if (plot_trend == TRUE) {
+    q <- q + stat_summary(aes_string(color = color_by), fun.data = "mean_cl_boot", 
+                          size = 0.35)
+    q <- q + stat_summary(aes_string(x = grouping, y = "expression", 
+                                     color = color_by, group = color_by), fun.data = "mean_cl_boot", 
+                          size = 0.35, geom = "line")
+  }
+  q <- q + scale_y_log10() + facet_wrap(~feature_label, nrow = nrow, 
+                                        ncol = ncol, scales = "free_y")
+  if (min_expr < 1) {
+    q <- q + expand_limits(y = c(min_expr, 1))
+  }
+  q <- q + ylab("Expression") + xlab(grouping)
+  q <- q + monocle:::monocle_theme_opts() + theme(axis.text.x = element_text(angle = 45, hjust=1))
+  q 
+}
+
+plot.cell.type.m3 <- function(cds, type) {
+  as.data.frame(colData(cds)) %>% 
+  mutate(Neuron = ifelse(Cell.type == type, T, F)) %>%
+  ggplot(aes(UMAP_1, UMAP_2)) + geom_point(aes(color = Neuron), size = 0.5)  + theme(legend.position = "none") + scale_color_manual(values = c("#595959", "red")) + ggtitle(type)
+}
+
+plot.expr.UMAP.m3 <- function(cds, gene_short_name, coexpr_gene = NULL, ncol = NULL,
+                     size = NULL, stroke = NULL,
+                     color.pal = c("grey85", "blue", "purple", "red")) {
+    if (!is.null(coexpr_gene)) {
+        gene.1 = gene_short_name
+        gene.2 = coexpr_gene
+        
+        gene.1.id = get.gene.id.m3(gene.1, cds)
+        gene.2.id = get.gene.id.m3(gene.2, cds)
+
+        colData(cds)$tmp.1 = cds@assays$data$counts[gene.1.id,]
+        colData(cds)$tmp.2 = cds@assays$data$counts[gene.2.id,]
+        
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.4
+
+        plot = ggplot(as.data.frame(colData(cds)), aes(x = UMAP_1, y = UMAP_2,
+                                      color = log2(pmin(tmp.1, tmp.2) / Size_Factor + 1),
+                                      alpha = tmp.1 > 0 & tmp.2 > 0)) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F, color = guide_colorbar(
+                title = paste("min(", gene.1, ", ", gene.2, ")", "\nnormalized\nlog2 expression", sep = ""))) +
+            monocle:::monocle_theme_opts()
+
+        colData(cds)$tmp.1 = NULL
+        colData(cds)$tmp.2 = NULL
+        return(plot)
+    }
+    
+    if (length(nchar(gene_short_name)) == 1) {
+        gene.id = get.gene.id.m3(gene_short_name, cds)
+        colData(cds)$tmp.expr = cds@assays$data$counts[gene.id,]
+        
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.4
+
+        plot = ggplot(as.data.frame(colData(cds)), aes(x = UMAP_1, y = UMAP_2,
+                                      color = log2(tmp.expr / Size_Factor + 1),
+                                      alpha = tmp.expr > 0)) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F,
+                   color = guide_colorbar(title = paste(gene_short_name, "\nnormalized\nlog2 expression", sep = ""))) +
+            monocle:::monocle_theme_opts()
+
+        colData(cds)$tmp.expr = NULL
+        return(plot)
+    } else {
+        tmp.df = colData(cds)[, c("cell", "UMAP_1", "UMAP_2")]
+        gene.ids = sapply(gene_short_name, function(x) get.gene.id.m3(x, cds))
+        gene.sanitized.name = sub("-", ".", gene_short_name)
+
+        for (i in 1:length(gene_short_name))
+            tmp.df[, gene.sanitized.name[i]] = cds@assays$data$counts[gene.ids[i],] / pData(cds)$Size_Factor
+            
+        tmp.df = melt(tmp.df, id.vars = c("cell", "UMAP_1", "UMAP_2"))
+            
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.2
+            
+        plot = ggplot(tmp.df, aes(x = UMAP_1, y = UMAP_2, color = log2(value+1),
+                                  alpha = value > 0)) +
+            facet_wrap(~ variable, ncol = ncol) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F) +
+            monocle:::monocle_theme_opts()
+            
+        return(plot)
+    }
+}
+
+assign.neuron.type.m3 <- function(subset.cds, full.cds) {
+  subset.LUT = data.frame(Barcode = colData(subset.cds)$Barcode, Neuron.type = colData(subset.cds)$Neuron.type)
+  full.LUT = data.frame(Barcode = colData(full.cds)$Barcode, Neuron.type = colData(full.cds)$Neuron.type)
+  
+  full.LUT = full.LUT %>% left_join(subset.LUT, by = "Barcode")
+  full.LUT$Neuron.type <- ifelse(
+    is.na(full.LUT$Neuron.type.y),
+    as.character(full.LUT$Neuron.type.x),
+    as.character(full.LUT$Neuron.type.y)
+  )
+  full.LUT$Neuron.type.x <- NULL
+  full.LUT$Neuron.type.y <- NULL
+  full.LUT 
+}
+
+quick.marker <- function(cds, column, value) {
+ cds.subset <- cds
+ 
+ colData(cds.subset)$tmp <- ifelse(
+  colData(cds.subset)$column == value,
+  1,
+  2
+ )
+ 
+ DEG <- top.markers(cds.subset, group_cells_by = "tmp")
+ DEG
+}

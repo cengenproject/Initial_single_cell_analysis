@@ -1,0 +1,924 @@
+two.set.differential.gene.test <- function(cds, set.1.filter, set.2.filter, formal = F, cores = 1) {
+    message(paste("# of cells in set 1:", sum(set.1.filter)))
+    message(paste("# of cells in set 2:", sum(set.2.filter)))
+    
+    s1.cds = cds[, set.1.filter]
+    s2.cds = cds[, set.2.filter]
+
+    s1.norm.expr = get.norm.expr.matrix(s1.cds)
+    s2.norm.expr = get.norm.expr.matrix(s2.cds)
+    
+    s1.tpm = Matrix::rowSums(s1.norm.expr)
+    s1.tpm = s1.tpm / sum(s1.tpm) * 1000000
+    s2.tpm = Matrix::rowSums(s2.norm.expr)
+    s2.tpm = s2.tpm / sum(s2.tpm) * 1000000
+    
+    s1.n.umi = Matrix::rowSums(exprs(s1.cds))
+    s2.n.umi = Matrix::rowSums(exprs(s2.cds))
+    
+    higher.expr = ifelse(s1.tpm > s2.tpm, "Set 1", "Set 2")
+    
+    s1.ratio = s1.tpm / (s2.tpm + 1)
+    s2.ratio = s2.tpm / (s1.tpm + 1)
+    log2.ratio = ifelse(
+        s1.tpm == 0 & s2.tpm == 0, 0, ifelse(
+            higher.expr == "Set 1", log2(s1.ratio), log2(s2.ratio)))
+    
+    
+    s1.n.expr = Matrix::rowSums(exprs(s1.cds) > 0)
+    s2.n.expr = Matrix::rowSums(exprs(s2.cds) > 0)
+        
+    s1.precision = s1.n.expr / (s1.n.expr + s2.n.expr)
+    s1.recall = s1.n.expr / ncol(s1.cds)
+    s2.precision = s2.n.expr / (s1.n.expr + s2.n.expr)
+    s2.recall = s2.n.expr / ncol(s2.cds)
+    
+    precision = ifelse(higher.expr == "Set 1", s1.precision, s2.precision)
+    recall = ifelse(higher.expr == "Set 1", s1.recall, s2.recall)
+        
+    f.score = 2 * precision * recall / (precision + recall)
+        
+    res = data.frame(
+        gene = fData(cds)$gene_short_name,
+        set.1.n.umi = s1.n.umi,
+        set.2.n.umi = s2.n.umi,
+        set.1.tpm = s1.tpm,
+        set.2.tpm = s2.tpm,
+        higher.expr = higher.expr,
+        log2.ratio = log2.ratio,
+        precision = precision,
+        recall = recall,
+        f.score = f.score
+    ) %>% dplyr::arrange(-f.score)
+        
+    if (formal) {
+        pData(cds)$tmp = ifelse(set.1.filter, 1, ifelse(set.2.filter, 2, NA))
+        
+        cds.subset = cds[, set.1.filter | set.2.filter]
+        cds.subset = estimateSizeFactors(cds.subset)
+        #cds.subset = estimateDispersions(cds.subset)
+        cds.subset = detectGenes(cds.subset, 0.1)
+        
+        expressed.genes = subset(fData(cds.subset), num_cells_expressed >= 5)[, 1]
+        message(paste(length(expressed.genes), "genes expressed in at least 5 cells across both sets"))
+        message("Computing differential expression p-values")
+
+        DEG = differentialGeneTest(cds.subset[expressed.genes,],
+            fullModelFormulaStr = "~ tmp", cores = cores)
+        
+        res = inner_join(res,
+            DEG %>% select(gene = gene_short_name, p.val = pval, q.val = qval),
+            by = "gene") %>% dplyr::arrange(q.val)
+        
+        pData(cds)$tmp = NULL
+    }
+
+    return(res)
+}
+
+plot.expr <- function(cds, gene_short_name, coexpr_gene = NULL, ncol = NULL,
+                     size = NULL, stroke = NULL,
+                     color.pal = c("grey85", "blue", "purple", "red")) {
+    if (!is.null(coexpr_gene)) {
+        gene.1 = gene_short_name
+        gene.2 = coexpr_gene
+        
+        gene.1.id = get.gene.id(gene.1, cds)
+        gene.2.id = get.gene.id(gene.2, cds)
+
+        pData(cds)$tmp.1 = exprs(cds)[gene.1.id,]
+        pData(cds)$tmp.2 = exprs(cds)[gene.2.id,]
+        
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.4
+
+        plot = ggplot(pData(cds), aes(x = tsne_1, y = tsne_2,
+                                      color = log2(pmin(tmp.1, tmp.2) / Size_Factor + 1),
+                                      alpha = tmp.1 > 0 & tmp.2 > 0)) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F, color = guide_colorbar(
+                title = paste("min(", gene.1, ", ", gene.2, ")", "\nnormalized\nlog2 expression", sep = ""))) +
+            monocle:::monocle_theme_opts()
+
+        pData(cds)$tmp.1 = NULL
+        pData(cds)$tmp.2 = NULL
+        return(plot)
+    }
+    
+    if (length(nchar(gene_short_name)) == 1) {
+        gene.id = get.gene.id(gene_short_name, cds)
+        pData(cds)$tmp.expr = exprs(cds)[gene.id,]
+        
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.4
+
+        plot = ggplot(pData(cds), aes(x = tsne_1, y = tsne_2,
+                                      color = log2(tmp.expr / Size_Factor + 1),
+                                      alpha = tmp.expr > 0)) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F,
+                   color = guide_colorbar(title = paste(gene_short_name, "\nnormalized\nlog2 expression", sep = ""))) +
+            monocle:::monocle_theme_opts()
+
+        pData(cds)$tmp.expr = NULL
+        return(plot)
+    } else {
+        tmp.df = pData(cds)[, c("cell", "tsne_1", "tsne_2")]
+        gene.ids = sapply(gene_short_name, function(x) get.gene.id(x, cds))
+        gene.sanitized.name = sub("-", ".", gene_short_name)
+
+        for (i in 1:length(gene_short_name))
+            tmp.df[, gene.sanitized.name[i]] = exprs(cds)[gene.ids[i],] / pData(cds)$Size_Factor
+            
+        tmp.df = melt(tmp.df, id.vars = c("cell", "tsne_1", "tsne_2"))
+            
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.2
+            
+        plot = ggplot(tmp.df, aes(x = tsne_1, y = tsne_2, color = log2(value+1),
+                                  alpha = value > 0)) +
+            facet_wrap(~ variable, ncol = ncol) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F) +
+            monocle:::monocle_theme_opts()
+            
+        return(plot)
+    }
+}
+
+plot.expr.UMAP <- function(cds, gene_short_name, coexpr_gene = NULL, ncol = NULL,
+                     size = NULL, stroke = NULL,
+                     color.pal = c("grey85", "blue", "purple", "red")) {
+    if (!is.null(coexpr_gene)) {
+        gene.1 = gene_short_name
+        gene.2 = coexpr_gene
+        
+        gene.1.id = get.gene.id(gene.1, cds)
+        gene.2.id = get.gene.id(gene.2, cds)
+
+        Biobase::pData(cds)$tmp.1 =  Biobase::exprs(cds)[gene.1.id,]
+         Biobase::pData(cds)$tmp.2 = exprs(cds)[gene.2.id,]
+        
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.4
+
+        plot = ggplot( Biobase::pData(cds), aes(x = UMAP_1, y = UMAP_2,
+                                      color = log2(pmin(tmp.1, tmp.2) / Size_Factor + 1),
+                                      alpha = tmp.1 > 0 & tmp.2 > 0)) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F, color = guide_colorbar(
+                title = paste("min(", gene.1, ", ", gene.2, ")", "\nnormalized\nlog2 expression", sep = ""))) +
+            monocle:::monocle_theme_opts()
+
+         Biobase::pData(cds)$tmp.1 = NULL
+         Biobase::pData(cds)$tmp.2 = NULL
+        return(plot)
+    }
+    
+    if (length(nchar(gene_short_name)) == 1) {
+        gene.id = get.gene.id(gene_short_name, cds)
+         Biobase::pData(cds)$tmp.expr =  Biobase::exprs(cds)[gene.id,]
+        
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.4
+
+        plot = ggplot( Biobase::pData(cds), aes(x = UMAP_1, y = UMAP_2,
+                                      color = log2(tmp.expr / Size_Factor + 1),
+                                      alpha = tmp.expr > 0)) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F,
+                   color = guide_colorbar(title = paste(gene_short_name, "\nnormalized\nlog2 expression", sep = ""))) +
+            monocle:::monocle_theme_opts()
+
+         Biobase::pData(cds)$tmp.expr = NULL
+        return(plot)
+    } else {
+        tmp.df =  Biobase::pData(cds)[, c("cell", "UMAP_1", "UMAP_2")]
+        gene.ids = sapply(gene_short_name, function(x) get.gene.id(x, cds))
+        gene.sanitized.name = sub("-", ".", gene_short_name)
+
+        for (i in 1:length(gene_short_name))
+            tmp.df[, gene.sanitized.name[i]] =  Biobase::exprs(cds)[gene.ids[i],] /  Biobase::pData(cds)$Size_Factor
+            
+        tmp.df = melt(tmp.df, id.vars = c("cell", "tsne_1", "tsne_2"))
+            
+        if (is.null(size)) size = 0.1
+        if (is.null(stroke)) stroke = 0.2
+            
+        plot = ggplot(tmp.df, aes(x = UMAP_1, y = UMAP_2, color = log2(value+1),
+                                  alpha = value > 0)) +
+            facet_wrap(~ variable, ncol = ncol) +
+            geom_point(size = size, stroke = stroke) +
+            scale_color_gradientn(colors = color.pal) +
+            scale_alpha_manual(values = c(1.0/3.0, 1.0)) +
+            guides(alpha = F) +
+            monocle:::monocle_theme_opts()
+            
+        return(plot)
+    }
+}
+
+get.gene.id <- function(symbol, cds = NULL, fData.df = NULL) {
+    if (is.null(fData.df))
+        fData.df = Biobase::fData(cds)
+    gene.id = as.character(fData.df[fData.df$gene_short_name == symbol, "id"])
+    return(gene.id)
+}
+
+is.neuron.type <- function(cds, x) {
+    with(pData(cds), !is.na(neuron.type) & neuron.type == x)
+}
+
+expresses.gene <- function(cds, gene) {
+    exprs(cds)[get.gene.id(gene, cds),] > 0
+}
+
+get.norm.expr.matrix <- function(cds) {
+    mat = exprs(cds)
+    mat@x = mat@x / rep.int(pData(cds)$Size_Factor, diff(mat@p))
+    return(mat)
+}
+
+show.expr.info <- function(gene, expr.info) {
+    if (class(expr.info) == "character") {
+        facet.name = gsub(" ", ".", tolower(expr.info))
+        expr.info = gsub("[.]", " ", tolower(expr.info))
+        if (expr.info == "tissue")
+            expr.info = tissue.expr.info
+        else if (expr.info == "cell type")
+            expr.info = cell.type.expr.info
+        else if (expr.info == "neuron type")
+            expr.info = neuron.type.expr.info
+        else if (expr.info == "global cluster")
+            expr.info = global.cluster.expr.info
+        else if (expr.info == "neuron cluster")
+            expr.info = neuron.cluster.expr.info
+        else if (expr.info == "cluster")
+            expr.info = L4.both.cluster.expr.info
+    } else {
+        facet.name = expr.info$facet
+    }
+    
+    gene.id = get.gene.id(gene, fData.df = expr.info$gene.annotations)
+    res = data.frame(
+        facet = names(expr.info$tpm[gene.id,]),
+        tpm = expr.info$tpm[gene.id,],
+        prop.cells.expr = expr.info$prop.cells.expr[gene.id,],
+        n.umi = expr.info$n.umi[gene.id,],
+        total.n.umi.for.facet = expr.info$total.n.umi.for.facet) %>%
+        arrange(facet)
+    colnames(res)[1] = facet.name
+    return(res)
+}
+
+new.expresses.gene <- function(cds, gene) {
+  exprs(cds)[get.gene.id(gene, cds),] > 2
+} 
+
+new_plot_genes_jitter <- function (cds, gene, grouping = "State", min_expr = NULL, cell_size = 0.75, 
+          nrow = NULL, ncol = 1, panel_order = NULL, color_by = NULL, 
+          plot_trend = FALSE, label_by_short_name = TRUE, relative_expr = TRUE) 
+  {
+  cds_subset <- cds[get.gene.id(gene, cds),]
+  
+  if (cds_subset@expressionFamily@vfamily %in% c("negbinomial", 
+                                                 "negbinomial.size")) {
+    integer_expression <- TRUE
+  }
+  else {
+    integer_expression <- FALSE
+    relative_expr <- TRUE
+  }
+  if (integer_expression) {
+    cds_exprs <- exprs(cds_subset)
+    if (relative_expr) {
+      if (is.null(sizeFactors(cds_subset))) {
+        stop("Error: to call this function with relative_expr=TRUE, you must call estimateSizeFactors() first")
+      }
+      cds_exprs <- Matrix::t(Matrix::t(cds_exprs)/sizeFactors(cds_subset))
+    }
+    cds_exprs <- reshape2::melt(round(as.matrix(cds_exprs)))
+  }
+  else {
+    cds_exprs <- exprs(cds_subset)
+    cds_exprs <- reshape2::melt(as.matrix(cds_exprs))
+  }
+  if (is.null(min_expr)) {
+    min_expr <- cds_subset@lowerDetectionLimit
+  }
+  colnames(cds_exprs) <- c("f_id", "Cell", "expression")
+  cds_exprs$expression[cds_exprs$expression < min_expr] <- min_expr
+  cds_pData <- pData(cds_subset)
+  cds_fData <- fData(cds_subset)
+  cds_exprs <- merge(cds_exprs, cds_fData, by.x = "f_id", by.y = "row.names")
+  cds_exprs <- merge(cds_exprs, cds_pData, by.x = "Cell", by.y = "row.names")
+  cds_exprs$adjusted_expression <- log10(cds_exprs$expression)
+  if (label_by_short_name == TRUE) {
+    if (is.null(cds_exprs$gene_short_name) == FALSE) {
+      cds_exprs$feature_label <- cds_exprs$gene_short_name
+      cds_exprs$feature_label[is.na(cds_exprs$feature_label)] <- cds_exprs$f_id
+    }
+    else {
+      cds_exprs$feature_label <- cds_exprs$f_id
+    }
+  }
+  else {
+    cds_exprs$feature_label <- cds_exprs$f_id
+  }
+  if (is.null(panel_order) == FALSE) {
+    cds_exprs$feature_label <- factor(cds_exprs$feature_label, 
+                                      levels = panel_order)
+  }
+  q <- ggplot(aes_string(x = grouping, y = "expression"), data = cds_exprs)
+  if (is.null(color_by) == FALSE) {
+    q <- q + geom_jitter(aes_string(color = color_by), size = I(cell_size))
+  }
+  else {
+    q <- q + geom_jitter(size = I(cell_size))
+  }
+  if (plot_trend == TRUE) {
+    q <- q + stat_summary(aes_string(color = color_by), fun.data = "mean_cl_boot", 
+                          size = 0.35)
+    q <- q + stat_summary(aes_string(x = grouping, y = "expression", 
+                                     color = color_by, group = color_by), fun.data = "mean_cl_boot", 
+                          size = 0.35, geom = "line")
+  }
+  q <- q + scale_y_log10() + facet_wrap(~feature_label, nrow = nrow, 
+                                        ncol = ncol, scales = "free_y")
+  if (min_expr < 1) {
+    q <- q + expand_limits(y = c(min_expr, 1))
+  }
+  q <- q + ylab("Expression") + xlab(grouping)
+  q <- q + monocle:::monocle_theme_opts()
+  q 
+}
+
+
+get.tpm.info <- function(gene, expr.info){
+  if (class(expr.info) == "character") {
+    facet.name = gsub(" ", ".", tolower(expr.info))
+    expr.info = gsub("[.]", " ", tolower(expr.info))
+    if (expr.info == "tissue")
+      expr.info = tissue.expr.info
+    else if (expr.info == "cell type")
+      expr.info = cell.type.expr.info
+    else if (expr.info == "neuron type")
+      expr.info = neuron.type.expr.info
+    else if (expr.info == "global cluster")
+      expr.info = global.cluster.expr.info
+    else if (expr.info == "neuron cluster")
+      expr.info = neuron.cluster.expr.info
+    else if (expr.info == "cluster")
+      expr.info = L4.six.expr.info
+    else if (expr.info == "spcluster")
+      expr.info = L4.Sparse.Cluster.Expr.info
+  } else {
+    facet.name = expr.info$facet
+  }
+  
+  gene.id = get.gene.id(gene, fData.df = expr.info$gene.annotations)
+  res = data.frame(
+    facet = names(expr.info$tpm[gene.id,]),
+    tpm = expr.info$tpm[gene.id,]) %>%
+    arrange(facet)
+  colnames(res)[1] = facet.name
+  return(res)
+}
+
+
+get.umi.info <- function(gene, expr.info) {
+  if (class(expr.info) == "character") {
+    facet.name = gsub(" ", ".", tolower(expr.info))
+    expr.info = gsub("[.]", " ", tolower(expr.info))
+    if (expr.info == "tissue")
+      expr.info = tissue.expr.info
+    else if (expr.info == "cell type")
+      expr.info = cell.type.expr.info
+    else if (expr.info == "neuron type")
+      expr.info = neuron.type.expr.info
+    else if (expr.info == "global cluster")
+      expr.info = global.cluster.expr.info
+    else if (expr.info == "neuron cluster")
+      expr.info = neuron.cluster.expr.info
+    else if (expr.info == "cluster")
+      expr.info = L2.VA.cluster.expr.info
+    else if (expr.info == "spcluster")
+      expr.info = L4.Sparse.Cluster.Expr.info
+    else if (expr.info == "L2cluster")
+      expr.info = L2.VA.cluster.expr.info
+  } else {
+    facet.name = expr.info$facet
+  }
+  
+  gene.id = get.gene.id(gene, fData.df = expr.info$gene.annotations)
+  res = data.frame(
+    facet = names(expr.info$tpm[gene.id,]),
+    n.umi = expr.info$n.umi[gene.id,]) %>%
+    arrange(facet)
+  colnames(res)[1] = facet.name
+  return(res)
+}
+
+get.proportion <- function(gene, expr.info) {
+  if (class(expr.info) == "character") {
+    facet.name = gsub(" ", ".", tolower(expr.info))
+    expr.info = gsub("[.]", " ", tolower(expr.info))
+    if (expr.info == "tissue")
+      expr.info = tissue.expr.info
+    else if (expr.info == "cell type")
+      expr.info = cell.type.expr.info
+    else if (expr.info == "neuron type")
+      expr.info = neuron.type.expr.info
+    else if (expr.info == "global cluster")
+      expr.info = global.cluster.expr.info
+    else if (expr.info == "neuron cluster")
+      expr.info = neuron.cluster.expr.info
+    else if (expr.info == "cluster")
+      expr.info = L4.cluster.expr.info
+    else if (expr.info == "spcluster")
+      expr.info = L4.Sparse.Cluster.Expr.info
+  } else {
+    facet.name = expr.info$facet
+  }
+  
+  gene.id = get.gene.id(gene, fData.df = expr.info$gene.annotations)
+  res = data.frame(
+    facet = names(expr.info$tpm[gene.id,]),
+    prop.cells.expr = expr.info$prop.cells.expr[gene.id,]) %>%
+    arrange(facet)
+  colnames(res)[1] = facet.name
+  return(res)
+}
+
+get.all.tpm.expr.info <- function(gene, x){
+  seq1 <- seq(from = 2, to = (length(gene)*2), by = 2)
+  colkeep <- c(1,seq1)
+  tmp <- lapply(gene, get.tpm.info, x)
+  tpm_all <- do.call(cbind, tmp)
+  tpm_all <- tpm_all[, colkeep]
+  colnames(tpm_all) <- c("Neuron.class", gene)
+  return(tpm_all)
+}
+
+get.all.umi <- function(gene, x){
+  seq1 <- seq(from = 2, to = (length(gene)*2), by = 2)
+  colkeep <- c(1, seq1)
+  tmp <- lapply(gene, get.umi.info, x)
+  umi_all <- do.call(cbind, tmp)
+  umi_all <- umi_all[, colkeep]
+  colnames(umi_all) <- c("Neuron.class", gene)
+  return(umi_all)
+}
+
+get.all.proportion <- function(gene, x){
+  seq1 <- seq(from = 2, to = (length(gene)*2), by = 2)
+  colkeep <- c(1, seq1)
+  tmp <- lapply(gene, get.proportion, x)
+  prop_all <- do.call(cbind, tmp)
+  prop_all <- prop_all[, colkeep]
+  colnames(prop_all) <- c("Neuron.class", gene)
+  return(prop_all)
+}
+
+set.neuron.type = function(cds, Neuron.type, logical.vec) {
+    pData(cds)$Neuron.type = ifelse(logical.vec, Neuron.type, pData(cds)$Neuron.type)
+    return(cds)
+}
+
+get.expr.info.by.facet <-   function(cds, pData.column) {
+    cell.assignments = pData(cds)[, pData.column]
+    
+    if (!(class(cell.assignments) %in% c("factor", "integer", "character"))) {
+        message("class(pData(cds)[, pData.column]) must be factor, integer, or character")
+    }
+    
+    if (class(cell.assignments) == "factor") {
+        unique.assignments = levels(cell.assignments)
+    } else {
+        unique.assignments = sort(setdiff(unique(cell.assignments), NA))
+    }
+    
+    norm.expr = exprs(cds)
+    norm.expr@x = norm.expr@x / rep.int(pData(cds)$Size_Factor, diff(norm.expr@p))
+
+    facet.norm.expr = list()
+    for (facet in unique.assignments) {
+        facet.norm.expr[[facet]] = norm.expr[, !is.na(cell.assignments) & cell.assignments == facet]
+    }
+        
+    message("Computing gene expression statistics")
+    
+    norm.means = sapply(unique.assignments, function(facet) {
+        Matrix::rowMeans(facet.norm.expr[[facet]])
+    })
+    
+    tpm = sweep(norm.means, 2, colSums(norm.means), "/") * 1000000
+
+    prop.cells.expr = sapply(unique.assignments, function(facet) {
+        apply(facet.norm.expr[[facet]], 1, function(x) sum(x > 0) / length(x))
+    })      
+
+    n.umi = sapply(unique.assignments, function(facet) {
+        Matrix::rowSums(exprs(cds)[, !is.na(cell.assignments) & cell.assignments == facet])
+    })
+    
+    n.cells = sapply(unique.assignments, function(facet) {
+        apply(facet.norm.expr[[facet]], 1, function(x) sum(x > 0))
+    })      
+    
+    total.n.umi.for.facet = sapply(unique.assignments, function(facet) {
+        sum(pData(cds)$n.umi[!is.na(cell.assignments) & cell.assignments == facet])
+    })
+
+    return(list(
+        tpm = tpm,
+        prop.cells.expr = prop.cells.expr,
+        n.umi = n.umi,
+        n.cells = n.cells, 
+        total.n.umi.for.facet = total.n.umi.for.facet,
+        norm.expr = norm.expr,
+        gene.annotations = fData(cds),
+        facet = pData.column
+    ))
+}
+
+substrSample <- function(x) {
+  sapply(x, function (xx)
+    substr(xx, 1, 2)
+  )	
+}
+
+
+get.tpm <- function(x) {
+    total <- sum(x)  
+    div <- x/total
+    TPM <- div*1000000
+    return(as.vector(TPM))
+}
+
+get.ambient.prof <- function (m, lower = 100){
+  discard <- Matrix::rowSums(m) == 0
+  m <- m[!discard, , drop = FALSE]
+  ncells <- ncol(m)
+  umi.sum <- as.integer(round(Matrix::colSums(m)))
+  ambient <- umi.sum <= lower
+  ambient.cells <- m[, ambient]
+  ambient.prof <- Matrix::rowSums(ambient.cells)
+  ambient.prop <- goodTuringProportions(ambient.prof)
+  ambient.TPM <- get.tpm(ambient.prof)
+  output <- data.frame(row.names = rownames(ambient.cells), id = rownames(ambient.cells), total.UMI = ambient.prof, TPM = ambient.TPM, Prop = ambient.prop)
+  output <- output %>% arrange(desc(Prop))
+  output
+}
+
+new.two.set.differential.gene.test <- function(cds, set.1.filter, set.2.filter, formal = F, cores = 1) {
+    message(paste("# of cells in set 1:", sum(set.1.filter)))
+    message(paste("# of cells in set 2:", sum(set.2.filter)))
+    
+    s1.cds = cds[, set.1.filter]
+    s2.cds = cds[, set.2.filter]
+
+    s1.norm.expr = get.norm.expr.matrix(s1.cds)
+    s2.norm.expr = get.norm.expr.matrix(s2.cds)
+    
+    s1.tpm = Matrix::rowSums(s1.norm.expr)
+    s1.tpm = s1.tpm / sum(s1.tpm) * 1000000
+    s2.tpm = Matrix::rowSums(s2.norm.expr)
+    s2.tpm = s2.tpm / sum(s2.tpm) * 1000000
+    
+    s1.n.umi = Matrix::rowSums(exprs(s1.cds))
+    s2.n.umi = Matrix::rowSums(exprs(s2.cds))
+    
+    higher.expr = ifelse(s1.tpm > s2.tpm, "Set 1", "Set 2")
+    
+    s1.ratio = s1.tpm / (s2.tpm + 1)
+    s2.ratio = s2.tpm / (s1.tpm + 1)
+    log2.ratio = ifelse(
+        s1.tpm == 0 & s2.tpm == 0, 0, ifelse(
+            higher.expr == "Set 1", log2(s1.ratio), log2(s2.ratio)))
+    
+    
+    s1.n.expr = Matrix::rowSums(exprs(s1.cds) > 0)
+    s2.n.expr = Matrix::rowSums(exprs(s2.cds) > 0)
+        
+    s1.precision = s1.n.expr / (s1.n.expr + s2.n.expr)
+    s1.recall = s1.n.expr / ncol(s1.cds)
+    s2.precision = s2.n.expr / (s1.n.expr + s2.n.expr)
+    s2.recall = s2.n.expr / ncol(s2.cds)
+    
+    precision = ifelse(higher.expr == "Set 1", s1.precision, s2.precision)
+    recall = ifelse(higher.expr == "Set 1", s1.recall, s2.recall)
+        
+    f.score = 2 * precision * recall / (precision + recall)
+        
+    res = data.frame(
+        gene = fData(cds)$gene_short_name,
+        set.1.n.umi = s1.n.umi,
+        set.2.n.umi = s2.n.umi,
+        set.1.tpm = s1.tpm,
+        set.2.tpm = s2.tpm,
+        higher.expr = higher.expr,
+        log2.ratio = log2.ratio,
+        precision = precision,
+        recall = recall,
+        f.score = f.score
+    ) %>% dplyr::arrange(-f.score)
+        
+    if (formal) {
+        pData(cds)$tmp = ifelse(set.1.filter, 1, ifelse(set.2.filter, 2, NA))
+        
+        cds.subset = cds[, set.1.filter | set.2.filter]
+        
+        expressed.genes = subset(fData(cds.subset), num_cells_expressed >= 1)[, 1]
+        message(paste(length(expressed.genes), "genes expressed in at least 5 cells across both sets"))
+        message("Computing differential expression p-values")
+
+        DEG = differentialGeneTest(cds.subset[expressed.genes,],
+            fullModelFormulaStr = "~ tmp", cores = cores)
+        
+        res = inner_join(res,
+            DEG %>% select(gene = gene_short_name, p.val = pval, q.val = qval),
+            by = "gene") %>% dplyr::arrange(q.val)
+        
+        pData(cds)$tmp = NULL
+    }
+
+    return(res)
+}
+
+lots_plot_genes_jitter <- function (cds, gene, grouping = "State", min_expr = NULL, cell_size = 0.75, 
+          nrow = NULL, ncol = 1, panel_order = NULL, color_by = NULL, 
+          plot_trend = FALSE, label_by_short_name = TRUE, relative_expr = TRUE) 
+  {
+  cds_subset <- cds[get.gene.id(gene, cds),]
+  
+  if (cds_subset@expressionFamily@vfamily %in% c("negbinomial", 
+                                                 "negbinomial.size")) {
+    integer_expression <- TRUE
+  }
+  else {
+    integer_expression <- FALSE
+    relative_expr <- TRUE
+  }
+  
+  if (integer_expression) {
+    cds_exprs <- Biobase::exprs(cds_subset)
+    if (relative_expr) {
+      if (is.null(sizeFactors(cds_subset))) {
+        stop("Error: to call this function with relative_expr=TRUE, you must call estimateSizeFactors() first")
+      }
+      cds_exprs <- Matrix::t(Matrix::t(cds_exprs)/sizeFactors(cds_subset))
+    }
+    cds_exprs <- reshape2::melt(round(as.matrix(cds_exprs)))
+  }
+  else {
+    cds_exprs <- Biobase::exprs(cds_subset)
+    cds_exprs <- reshape2::melt(as.matrix(cds_exprs))
+  }
+  if (is.null(min_expr)) {
+    min_expr <- cds_subset@lowerDetectionLimit
+  }
+  colnames(cds_exprs) <- c("f_id", "Cell", "expression")
+  cds_exprs$expression[cds_exprs$expression < min_expr] <- min_expr
+  cds_pData <- Biobase::pData(cds_subset)
+  cds_fData <- Biobase::fData(cds_subset)
+  cds_exprs <- merge(cds_exprs, cds_fData, by.x = "f_id", by.y = "row.names")
+  cds_exprs <- merge(cds_exprs, cds_pData, by.x = "Cell", by.y = "row.names")
+  cds_exprs$adjusted_expression <- log10(cds_exprs$expression)
+  if (label_by_short_name == TRUE) {
+    if (is.null(cds_exprs$gene_short_name) == FALSE) {
+      cds_exprs$feature_label <- cds_exprs$gene_short_name
+      cds_exprs$feature_label[is.na(cds_exprs$feature_label)] <- cds_exprs$f_id
+    }
+    else {
+      cds_exprs$feature_label <- cds_exprs$f_id
+    }
+  }
+  else {
+    cds_exprs$feature_label <- cds_exprs$f_id
+  }
+  if (is.null(panel_order) == FALSE) {
+    cds_exprs$feature_label <- factor(cds_exprs$feature_label, 
+                                      levels = panel_order)
+  }
+  q <- ggplot(aes_string(x = grouping, y = "expression"), data = cds_exprs)
+  if (is.null(color_by) == FALSE) {
+    q <- q + geom_jitter(aes_string(color = color_by), size = I(cell_size))
+  }
+  else {
+    q <- q + geom_jitter(size = I(cell_size))
+  }
+  if (plot_trend == TRUE) {
+    q <- q + stat_summary(aes_string(color = color_by), fun.data = "mean_cl_boot", 
+                          size = 0.35)
+    q <- q + stat_summary(aes_string(x = grouping, y = "expression", 
+                                     color = color_by, group = color_by), fun.data = "mean_cl_boot", 
+                          size = 0.35, geom = "line")
+  }
+  q <- q + scale_y_log10() + facet_wrap(~feature_label, nrow = nrow, 
+                                        ncol = ncol, scales = "free_y")
+  if (min_expr < 1) {
+    q <- q + expand_limits(y = c(min_expr, 1))
+  }
+  q <- q + ylab("Expression") + xlab(grouping)
+  q <- q + monocle:::monocle_theme_opts() + theme(axis.text.x = element_text(angle = 45, hjust=1))
+  q 
+}
+
+assign.neuron.type <- function(subset.cds, full.cds) {
+  subset.LUT = data.frame(Barcode = pData(subset.cds)$Barcode, Neuron.type = pData(subset.cds)$Neuron.type)
+  full.LUT = data.frame(Barcode = pData(full.cds)$Barcode, Neuron.type = pData(full.cds)$Neuron.type)
+  
+  full.LUT = full.LUT %>% left_join(subset.LUT, by = "Barcode")
+  full.LUT$Neuron.type <- ifelse(
+    is.na(full.LUT$Neuron.type.y),
+    as.character(full.LUT$Neuron.type.x),
+    as.character(full.LUT$Neuron.type.y)
+  )
+  full.LUT$Neuron.type.x <- NULL
+  full.LUT$Neuron.type.y <- NULL
+  full.LUT 
+}
+
+max.function <- function(x) {
+  max.index = which.max(x)
+  max.index
+}
+
+get.L4.tpm.info <- function(gene, expr.info){
+  if (class(expr.info) == "character") {
+    facet.name = gsub(" ", ".", tolower(expr.info))
+    expr.info = gsub("[.]", " ", tolower(expr.info))
+    if (expr.info == "tissue")
+      expr.info = tissue.expr.info
+    else if (expr.info == "cell type")
+      expr.info = cell.type.expr.info
+    else if (expr.info == "raw neuron type")
+      expr.info = L4.neurons.expr
+    else if (expr.info == "corrected neuron type")
+      expr.info = L4.neurons.corrected.expr
+    else if (expr.info == "all cells")
+      expr.info = L4.all.cells.expr
+    else if (expr.info == "corrected all cells")
+      expr.info = L4.all.cells.corrected.expr
+    else if (expr.info == "spcluster")
+      expr.info = L4.Sparse.Cluster.Expr.info
+  } else {
+    facet.name = expr.info$facet
+  }
+  
+  gene.id = as.character(lapply(gene, get.gene.id, fData.df = expr.info$gene.annotations))
+  res = data.frame(
+    facet = rownames(expr.info$tpm[gene.id,]),
+    tpm = expr.info$tpm[gene.id,]) %>%
+    arrange(facet)
+  colnames(res)[1] = facet.name
+  return(res)
+}
+
+get.L4.umi.info <- function(gene, expr.info) {
+  if (class(expr.info) == "character") {
+    facet.name = gsub(" ", ".", tolower(expr.info))
+    expr.info = gsub("[.]", " ", tolower(expr.info))
+    if (expr.info == "tissue")
+      expr.info = tissue.expr.info
+    else if (expr.info == "cell type")
+      expr.info = cell.type.expr.info
+    else if (expr.info == "raw neuron type")
+      expr.info = L4.neurons.expr
+    else if (expr.info == "corrected neuron type")
+      expr.info = L4.neurons.corrected.expr
+    else if (expr.info == "all cells")
+      expr.info = L4.all.cells.expr
+    else if (expr.info == "corrected all cells")
+      expr.info = L4.all.cells.corrected.expr
+    else if (expr.info == "spcluster")
+      expr.info = L4.Sparse.Cluster.Expr.info
+  } else {
+    facet.name = expr.info$facet
+  }
+  
+  gene.id = as.character(lapply(gene, get.gene.id, fData.df = expr.info$gene.annotations))
+  res = data.frame(
+    facet = rownames(expr.info$tpm[gene.id,]),
+    n.umi = expr.info$n.umi[gene.id,]) %>%
+    arrange(facet)
+  colnames(res)[1] = facet.name
+  return(res)
+}
+
+get.L4.proportion <- function(gene, expr.info) {
+  if (class(expr.info) == "character") {
+    facet.name = gsub(" ", ".", tolower(expr.info))
+    expr.info = gsub("[.]", " ", tolower(expr.info))
+    if (expr.info == "tissue")
+      expr.info = tissue.expr.info
+    else if (expr.info == "cell type")
+      expr.info = cell.type.expr.info
+    else if (expr.info == "raw neuron type")
+      expr.info = L4.neurons.expr
+    else if (expr.info == "corrected neuron type")
+      expr.info = L4.neurons.corrected.expr
+    else if (expr.info == "all cells")
+      expr.info = L4.all.cells.expr
+    else if (expr.info == "corrected all cells")
+      expr.info = L4.all.cells.corrected.expr
+    else if (expr.info == "spcluster")
+      expr.info = L4.Sparse.Cluster.Expr.info
+  } else {
+    facet.name = expr.info$facet
+  }
+  
+  gene.id = as.character(lapply(gene, get.gene.id, fData.df = expr.info$gene.annotations))
+  res = data.frame(
+    facet = rownames(expr.info$tpm[gene.id,]),
+    prop.cells.expr = expr.info$prop.cells.expr[gene.id,]) %>%
+    arrange(facet)
+  colnames(res)[1] = facet.name
+  return(res)
+}
+
+get.norm.expr.matrix.TPM <- function(cds) {
+    mat = exprs(cds)
+    mat@x = mat@x / rep.int(pData(cds)$Size_Factor, diff(mat@p))
+    mat@x = mat@x / rep.int(Matrix::colSums(mat), diff(mat@p)) * 1000000
+    return(mat)
+}
+
+plot.cell.type <- function(cds, type) {
+  pData(cds) %>% 
+  mutate(Neuron = ifelse(Neuron.type == type, T, F)) %>%
+  ggplot(aes(UMAP_1, UMAP_2)) + geom_point(aes(color = Neuron), size = 0.5)  + theme(legend.position = "none") + scale_color_manual(values = c("#595959", "red"))
+}
+
+function(x) {
+  max.index = which.max(x)
+  max.index
+}
+
+get.expr.info.by.facet.3 <-   function(cds, colData.column) {
+    cell.assignments = colData(cds)[, colData.column]
+    
+    if (!(class(cell.assignments) %in% c("factor", "integer", "character"))) {
+        message("class(pData(cds)[, colData.column]) must be factor, integer, or character")
+    }
+    
+    if (class(cell.assignments) == "factor") {
+        unique.assignments = levels(cell.assignments)
+    } else {
+        unique.assignments = sort(setdiff(unique(cell.assignments), NA))
+    }
+    
+    norm.expr = exprs(cds)
+    norm.expr@x = norm.expr@x / rep.int(colData(cds)$Size_Factor, diff(norm.expr@p))
+
+    facet.norm.expr = list()
+    for (facet in unique.assignments) {
+        facet.norm.expr[[facet]] = norm.expr[, !is.na(cell.assignments) & cell.assignments == facet]
+    }
+        
+    message("Computing gene expression statistics")
+    
+    norm.means = sapply(unique.assignments, function(facet) {
+        Matrix::rowMeans(facet.norm.expr[[facet]])
+    })
+    
+    tpm = sweep(norm.means, 2, colSums(norm.means), "/") * 1000000
+
+    prop.cells.expr = sapply(unique.assignments, function(facet) {
+        apply(facet.norm.expr[[facet]], 1, function(x) sum(x > 0) / length(x))
+    })
+
+    n.cells = sapply(unique.assignments, function(facet) {
+        apply(facet.norm.expr[[facet]], 1, function(x) sum(x > 0))
+    })
+
+    n.umi = sapply(unique.assignments, function(facet) {
+        Matrix::rowSums(exprs(cds)[, !is.na(cell.assignments) & cell.assignments == facet])
+    })
+    
+    total.n.umi.for.facet = sapply(unique.assignments, function(facet) {
+        sum(colData(cds)$n.umi[!is.na(cell.assignments) & cell.assignments == facet])
+    })
+
+    return(list(
+        tpm = tpm,
+        prop.cells.expr = prop.cells.expr,
+        n.umi = n.umi,
+        n.cells = n.cells,
+        total.n.umi.for.facet = total.n.umi.for.facet,
+        norm.expr = norm.expr,
+        gene.annotations = rowData(cds),
+        facet = colData.column
+    ))
+}
